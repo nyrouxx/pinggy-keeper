@@ -75,20 +75,49 @@ class KeeperTests(unittest.TestCase):
         connection.getresponse.return_value.status = 200
         connection.request.side_effect = request
         urls = ["udp://example.test:51820"]
+        settings = keeper.read_settings({
+            "PINGGY_TOKEN": "pinggy-example",
+            "FREEDNS_TOKEN": "example-token",
+        })
+        update_url = settings.freedns_update_url
         with (
             patch.object(socket, "getaddrinfo", side_effect=resolve),
             patch.object(http.client, "HTTPSConnection", return_value=connection) as https,
         ):
             with self.assertRaisesRegex(keeper.SyncError, "did not confirm"):
-                keeper.sync_endpoint(urls, "example-token")
+                keeper.sync_endpoint(urls, update_url)
             reject_update = False
-            initial = keeper.sync_endpoint(urls, "example-token")
-            self.assertEqual(keeper.sync_endpoint(urls, "example-token", initial), initial)
+            initial = keeper.sync_endpoint(urls, update_url)
+            self.assertEqual(keeper.sync_endpoint(urls, update_url, initial), initial)
             urls = ["udp://example.test:51821"]
-            port_change = keeper.sync_endpoint(urls, "example-token", initial)
+            port_change = keeper.sync_endpoint(urls, update_url, initial)
             ipv4 = "203.0.113.9"
-            host_change = keeper.sync_endpoint(urls, "example-token", port_change)
+            host_change = keeper.sync_endpoint(urls, update_url, port_change)
         self.assertEqual(port_change, "2001::ca6d:cb00:7108")
         self.assertEqual(host_change, "2001::ca6d:cb00:7109")
         self.assertEqual(updates, [initial, initial, port_change, host_change])
         https.assert_called_with("sync.afraid.org", timeout=8)
+
+    def test_v1_direct_url_publishes_the_encoded_aaaa_address(self):
+        settings = keeper.read_settings({
+            "PINGGY_TOKEN": "pinggy-example",
+            "FREEDNS_UPDATE_URL": "https://freedns.afraid.org/dynamic/update.php?example+/token==",
+            "FREEDNS_TOKEN": "old-example-token",
+        })
+        connection = Mock()
+        response = connection.getresponse.return_value
+        response.status = 200
+        address = "2001::ca6c:cb00:7108"
+
+        with patch.object(http.client, "HTTPSConnection", return_value=connection) as https:
+            response.read.return_value = b"Updated wg.example.test to 2001::CA6C:CB00:7108 in 0.041 seconds\n"
+            keeper.update_freedns(settings.freedns_update_url, address)
+            https.assert_called_once_with("freedns.afraid.org", timeout=8)
+            connection.request.assert_called_once_with(
+                "GET", "/dynamic/update.php?example+/token==&address=2001%3A%3Aca6c%3Acb00%3A7108",
+            )
+
+            response.read.return_value = b"ERROR: Address 2001::ca6c:cb00:7108 has not changed.\n"
+            keeper.update_freedns(settings.freedns_update_url, address)
+            with self.assertRaisesRegex(keeper.SyncError, "did not confirm"):
+                keeper.update_freedns(settings.freedns_update_url, "2001::ca6d:cb00:7108")

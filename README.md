@@ -18,19 +18,24 @@ Python-сервис открывает UDP-туннель через офици�
 
 ## Настройка
 
-1. В FreeDNS создайте отдельную запись типа **AAAA** для WireGuard и включите
-   динамическое обновление в интерфейсе v2. Из ссылки `/u/<token>/` возьмите
-   токен этой записи. Если используете связанные обновления FreeDNS, выделите
-   записи отдельный начальный адрес или отключите связанные обновления.
-   [FreeDNS Dynamic DNS v2](https://freedns.afraid.org/dynamic/v2/) · [Документация FreeDNS](https://freedns.afraid.org/guide/dd-wrt-v2/)
+1. В FreeDNS создайте отдельную запись типа **AAAA** для WireGuard. Скопируйте
+   её **Direct URL** из раздела Dynamic DNS целиком. Если FreeDNS вывел строки
+   `имя|адрес|ссылка`, возьмите третье поле строки с вашей AAAA-записью.
+   Keeper поддерживает ссылки v1 `freedns.afraid.org/dynamic/update.php?...` и v2
+   `v6.sync.afraid.org/u/.../`. Если используете связанные обновления FreeDNS,
+   выделите записи отдельный начальный адрес или отключите связанные обновления.
+   [FreeDNS Dynamic DNS](https://freedns.afraid.org/dynamic/) · [Документация FreeDNS v2](https://freedns.afraid.org/guide/dd-wrt-v2/)
 2. Возьмите токен туннеля в аккаунте Pinggy. Выберите сервер, указанный в
    команде подключения в панели Pinggy. [Панель Pinggy](https://dashboard.pinggy.io/)
-3. Скопируйте шаблон и заполните `PINGGY_TOKEN` и `FREEDNS_TOKEN` в файле `.env`.
+3. Скопируйте шаблон и заполните `PINGGY_TOKEN` и `FREEDNS_UPDATE_URL` в файле `.env`.
 
    ```sh
    cp .env.example .env
    chmod 600 .env
    ```
+
+   Для существующего `.env` добавьте `FREEDNS_UPDATE_URL` с полной ссылкой.
+   При пустом `FREEDNS_UPDATE_URL` keeper использует прежний `FREEDNS_TOKEN` для v2.
 
 4. Укажите ваш локальный `WIREGUARD_PORT`. По умолчанию используется `51820`.
    `PINGGY_SERVER` и `POLL_INTERVAL_SECONDS` задаются по необходимости, их значения

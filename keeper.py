@@ -9,12 +9,17 @@ import signal
 import socket
 import threading
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 
 log = logging.getLogger("pinggy-keeper")
 IP4P_PREFIX = ipaddress.IPv6Address("2001::").packed[:10]
 ENDPOINT = re.compile(r"(udp://)?([a-z0-9.-]+):([0-9]{1,5})/?", re.IGNORECASE)
+FREEDNS_V1_URL = re.compile(
+    r"https?://freedns\.afraid\.org/dynamic/update\.php\?"
+    r"(?:[A-Za-z0-9+/_-]|%2[BbFf])+(?:=|%3[Dd]){0,2}"
+)
+FREEDNS_V2_URL = re.compile(r"https?://(?:v6\.)?sync\.afraid\.org/u/[A-Za-z0-9_-]+/")
 
 
 class SyncError(Exception):
@@ -25,7 +30,7 @@ class SyncError(Exception):
 class Settings:
     pinggy_token: str
     pinggy_server: str
-    freedns_token: str
+    freedns_update_url: str
     wireguard_port: int
     poll_seconds: int
 
@@ -39,18 +44,22 @@ def read_integer(env, name, default, maximum):
 
 def read_settings(env):
     pinggy_token = env.get("PINGGY_TOKEN", "").strip()
-    freedns_token = env.get("FREEDNS_TOKEN", "").strip()
+    freedns_update_url = env.get("FREEDNS_UPDATE_URL", "").strip()
     pinggy_server = env.get("PINGGY_SERVER", "free.pinggy.io").strip()
     if not pinggy_token:
         raise ValueError("Set PINGGY_TOKEN to the access token from Pinggy")
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", freedns_token):
-        raise ValueError("Set FREEDNS_TOKEN to the token from the FreeDNS v2 update URL")
+    if not freedns_update_url:
+        freedns_token = env.get("FREEDNS_TOKEN", "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]+", freedns_token):
+            freedns_update_url = f"https://sync.afraid.org/u/{freedns_token}/"
+    if not (FREEDNS_V1_URL.fullmatch(freedns_update_url) or FREEDNS_V2_URL.fullmatch(freedns_update_url)):
+        raise ValueError("Set FREEDNS_UPDATE_URL to the FreeDNS update link for the AAAA record")
     if not re.fullmatch(r"[A-Za-z0-9.-]+", pinggy_server):
         raise ValueError("PINGGY_SERVER must be a hostname, such as free.pinggy.io")
     return Settings(
         pinggy_token=pinggy_token,
         pinggy_server=pinggy_server,
-        freedns_token=freedns_token,
+        freedns_update_url=freedns_update_url,
         wireguard_port=read_integer(env, "WIREGUARD_PORT", 51820, 65535),
         poll_seconds=read_integer(env, "POLL_INTERVAL_SECONDS", 10, 3600),
     )
@@ -93,11 +102,16 @@ def resolve_ipv4(host, port, previous):
     return next((ip for ip in addresses if encode_ip4p(ip, port) == previous), addresses[0])
 
 
-def update_freedns(token, address):
-    query = urlencode({"ip": address})
+def update_freedns(update_url, address):
+    url = urlsplit(update_url)
+    is_v1 = url.path == "/dynamic/update.php"
+    if is_v1:
+        query = url.query + "&" + urlencode({"address": address})
+    else:
+        query = urlencode({"ip": address})
     try:
-        with closing(http.client.HTTPSConnection("sync.afraid.org", timeout=8)) as connection:
-            connection.request("GET", f"/u/{token}/?{query}")
+        with closing(http.client.HTTPSConnection(url.hostname, timeout=8)) as connection:
+            connection.request("GET", f"{url.path}?{query}")
             response = connection.getresponse()
             if response.status != 200:
                 raise SyncError(f"FreeDNS returned HTTP {response.status}")
@@ -105,24 +119,31 @@ def update_freedns(token, address):
     except (OSError, http.client.HTTPException):
         raise SyncError("FreeDNS request failed or timed out") from None
 
-    if re.match(r"No IP change detected\b", body, re.IGNORECASE):
-        return
-    updated = re.fullmatch(r"Updated\s+\S+\s+from\s+\S+\s+to\s+(\S+)", body, re.IGNORECASE)
-    if updated:
+    if is_v1:
+        result = re.fullmatch(
+            r"Updated\s+[^\r\n]+?\s+to\s+([0-9a-f:.]+?)(?:\s+in\s+[0-9.]+\s+seconds?)?\.?",
+            body,
+            re.IGNORECASE,
+        ) or re.fullmatch(r"ERROR:\s+Address\s+(\S+)\s+has not changed\.?", body, re.IGNORECASE)
+    else:
+        if re.match(r"No IP change detected\b", body, re.IGNORECASE):
+            return
+        result = re.fullmatch(r"Updated\s+\S+\s+from\s+\S+\s+to\s+(\S+)", body, re.IGNORECASE)
+    if result:
         try:
-            if str(ipaddress.IPv6Address(updated[1])) == address:
+            if str(ipaddress.IPv6Address(result[1])) == address:
                 return
         except ValueError:
             pass
-    raise SyncError("FreeDNS did not confirm the AAAA update. Check the v2 token for the AAAA record")
+    raise SyncError("FreeDNS did not confirm the AAAA update. Check the update link for the AAAA record")
 
 
-def sync_endpoint(urls, token, previous=None):
+def sync_endpoint(urls, update_url, previous=None):
     host, port = udp_endpoint(urls)
     ipv4 = resolve_ipv4(host, port, previous)
     address = encode_ip4p(ipv4, port)
     if address != previous:
-        update_freedns(token, address)
+        update_freedns(update_url, address)
         log.info("FreeDNS AAAA %s (%s:%s)", address, ipv4, port)
     return address
 
@@ -173,7 +194,7 @@ def run(settings, stopped):
                     if tunnel is None:
                         break
                     log.info("Pinggy UDP tunnel established")
-                last_published = sync_endpoint(tunnel.urls, settings.freedns_token, last_published)
+                last_published = sync_endpoint(tunnel.urls, settings.freedns_update_url, last_published)
             except SyncError as error:
                 log.warning("%s. Retrying in %ss", error, backoff)
                 stopped.wait(backoff)

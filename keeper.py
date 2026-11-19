@@ -13,6 +13,7 @@ from urllib.parse import urlencode, urlsplit
 
 
 log = logging.getLogger("pinggy-keeper")
+TUNNEL_MAX_AGE_SECONDS = 55 * 60
 IP4P_PREFIX = ipaddress.IPv6Address("2001::").packed[:10]
 ENDPOINT = re.compile(r"(udp://)?([a-z0-9.-]+):([0-9]{1,5})/?", re.IGNORECASE)
 FREEDNS_V1_URL = re.compile(
@@ -148,7 +149,7 @@ def sync_endpoint(urls, update_url, previous=None):
     return address
 
 
-def start_tunnel(settings, stopped):
+def start_tunnel(settings, stopped, disconnected):
     from pinggy import Tunnel
     from pinggy.pylib import TunnelState
 
@@ -158,16 +159,19 @@ def start_tunnel(settings, stopped):
         tunnel.token = settings.pinggy_token
         tunnel.webdebugger_port = 0
         tunnel.auto_reconnect = False
+        tunnel.on_disconnected = lambda _message: disconnected.set()
         tunnel.add_forwarding(f"127.0.0.1:{settings.wireguard_port}", type="udp")
         tunnel.start(thread=True, block_until_ready=False)
         deadline = time.monotonic() + 60
         final_states = {TunnelState.Invalid, TunnelState.Stopped, TunnelState.Ended}
         while not stopped.is_set():
             state = tunnel.state
+            if disconnected.is_set() or state in final_states:
+                raise SyncError("Pinggy did not establish a UDP tunnel")
             if state is TunnelState.ForwardingSucceeded and tunnel.urls:
                 ready = True
                 return tunnel
-            if state in final_states or time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
                 raise SyncError("Pinggy did not establish a UDP tunnel")
             stopped.wait(0.25)
         return None
@@ -180,28 +184,42 @@ def run(settings, stopped):
     from pinggy.pylib import TunnelState
 
     tunnel = None
+    disconnected = None
+    renew_at = 0.0
     last_published = None
     backoff = settings.poll_seconds
     log.info("Forwarding UDP to 127.0.0.1:%s", settings.wireguard_port)
     try:
         while not stopped.is_set():
             try:
-                if tunnel is not None and tunnel.state is not TunnelState.ForwardingSucceeded:
-                    tunnel.stop()
-                    tunnel = None
+                if tunnel is not None:
+                    lost = disconnected.is_set() or tunnel.state is not TunnelState.ForwardingSucceeded
+                    if lost or time.monotonic() >= renew_at:
+                        if lost:
+                            log.warning("Pinggy UDP tunnel disconnected; reconnecting")
+                        else:
+                            log.info("Recreating Pinggy UDP tunnel after %s minutes", TUNNEL_MAX_AGE_SECONDS // 60)
+                        tunnel.stop()
+                        tunnel = None
                 if tunnel is None:
-                    tunnel = start_tunnel(settings, stopped)
+                    disconnected = threading.Event()
+                    renew_at = time.monotonic() + TUNNEL_MAX_AGE_SECONDS
+                    tunnel = start_tunnel(settings, stopped, disconnected)
                     if tunnel is None:
                         break
                     log.info("Pinggy UDP tunnel established")
                 last_published = sync_endpoint(tunnel.urls, settings.freedns_update_url, last_published)
             except SyncError as error:
-                log.warning("%s. Retrying in %ss", error, backoff)
-                stopped.wait(backoff)
+                log.warning("%s. Retry backoff: %ss", error, backoff)
+                delay = backoff
                 backoff = min(backoff * 2, max(settings.poll_seconds, 300))
             else:
                 backoff = settings.poll_seconds
-                stopped.wait(settings.poll_seconds)
+                delay = settings.poll_seconds
+            if tunnel is not None:
+                remaining = 0 if disconnected.is_set() else max(0, renew_at - time.monotonic())
+                delay = min(delay, remaining)
+            stopped.wait(delay)
     finally:
         if tunnel is not None:
             tunnel.stop()

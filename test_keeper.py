@@ -11,14 +11,15 @@ from urllib.parse import parse_qs, urlsplit
 import keeper
 
 
+class TunnelState(Enum):
+    Invalid = auto()
+    Stopped = auto()
+    Ended = auto()
+    ForwardingSucceeded = auto()
+
+
 class KeeperTests(unittest.TestCase):
     def test_sdk_forwards_udp_to_the_selected_loopback_port(self):
-        class TunnelState(Enum):
-            Invalid = auto()
-            Stopped = auto()
-            Ended = auto()
-            ForwardingSucceeded = auto()
-
         settings = keeper.read_settings({
             "PINGGY_TOKEN": "pinggy-example",
             "FREEDNS_TOKEN": "freedns-example",
@@ -33,12 +34,91 @@ class KeeperTests(unittest.TestCase):
             "pinggy": SimpleNamespace(Tunnel=tunnel_factory),
             "pinggy.pylib": SimpleNamespace(TunnelState=TunnelState),
         }
+        disconnected = Event()
         with patch.dict(sys.modules, modules):
-            self.assertIs(keeper.start_tunnel(settings, Event()), tunnel)
+            self.assertIs(keeper.start_tunnel(settings, Event(), disconnected), tunnel)
         tunnel_factory.assert_called_once_with(server_address="free.pinggy.io:443")
         tunnel.add_forwarding.assert_called_once_with("127.0.0.1:12345", type="udp")
         tunnel.start.assert_called_once_with(thread=True, block_until_ready=False)
         self.assertEqual(tunnel.webdebugger_port, 0)
+        tunnel.on_disconnected("session closed")
+        self.assertTrue(disconnected.is_set())
+
+    def test_rotation_deadline_applies_even_during_dns_backoff(self):
+        settings = keeper.read_settings({
+            "PINGGY_TOKEN": "pinggy-example",
+            "FREEDNS_TOKEN": "freedns-example",
+            "POLL_INTERVAL_SECONDS": "3600",
+        })
+        old = Mock(state=TunnelState.ForwardingSucceeded, urls=["udp://example.test:11111"])
+        new = Mock(state=TunnelState.ForwardingSucceeded, urls=["udp://example.test:22222"])
+        stopped = Event()
+        modules = {"pinggy.pylib": SimpleNamespace(TunnelState=TunnelState)}
+        clock = 100.0
+        waits = []
+
+        def wait(delay):
+            nonlocal clock
+            waits.append(delay)
+            clock += delay
+            if len(waits) == 2:
+                stopped.set()
+
+        def start(_settings, _stopped, _disconnected):
+            if not waits:
+                return old
+            old.stop.assert_called_once_with()
+            self.assertEqual(clock, 100 + 55 * 60)
+            return new
+
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(keeper.time, "monotonic", side_effect=lambda: clock),
+            patch.object(stopped, "wait", side_effect=wait),
+            patch.object(keeper, "start_tunnel", side_effect=start),
+            patch.object(keeper, "sync_endpoint", side_effect=[keeper.SyncError("DNS unavailable"), "2001::1"]) as sync,
+            self.assertLogs(keeper.log, "INFO") as logs,
+        ):
+            keeper.run(settings, stopped)
+
+        self.assertEqual(waits, [55 * 60, 55 * 60])
+        self.assertTrue(any("after 55 minutes" in entry for entry in logs.output))
+        sync.assert_called_with(new.urls, settings.freedns_update_url, None)
+        new.stop.assert_called_once_with()
+
+    def test_recreates_when_sdk_signals_disconnect_with_stale_active_state(self):
+        settings = keeper.read_settings({"PINGGY_TOKEN": "pinggy-example", "FREEDNS_TOKEN": "freedns-example"})
+        old = Mock(state=TunnelState.ForwardingSucceeded, urls=["udp://example.test:11111"])
+        new = Mock(state=TunnelState.ForwardingSucceeded, urls=["udp://example.test:22222"])
+        stopped = Event()
+        modules = {"pinggy.pylib": SimpleNamespace(TunnelState=TunnelState)}
+        sessions = []
+
+        def start(_settings, _stopped, disconnected):
+            sessions.append(disconnected)
+            return old if len(sessions) == 1 else new
+
+        def wait(_delay):
+            if len(sessions) == 1:
+                sessions[0].set()
+            else:
+                stopped.set()
+
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(stopped, "wait", side_effect=wait),
+            patch.object(keeper, "start_tunnel", side_effect=start),
+            patch.object(keeper, "sync_endpoint", side_effect=["2001::1", "2001::2"]) as sync,
+            self.assertLogs(keeper.log, "WARNING") as logs,
+        ):
+            keeper.run(settings, stopped)
+
+        self.assertEqual(len(sessions), 2)
+        self.assertIsNot(sessions[0], sessions[1])
+        self.assertTrue(any("disconnected; reconnecting" in entry for entry in logs.output))
+        sync.assert_called_with(new.urls, settings.freedns_update_url, "2001::1")
+        old.stop.assert_called_once_with()
+        new.stop.assert_called_once_with()
 
     def test_ip4p_and_udp_selection(self):
         self.assertEqual(keeper.encode_ip4p("203.0.113.8", 51820), "2001::ca6c:cb00:7108")

@@ -1,28 +1,15 @@
 name: pinggy-keeper
 
 services:
-  pinggy:
-    image: pinggy/pinggy@sha256:15af4610028da251d36af2f6765693102a188e5628c033ac2ae42ab8ae7e25e7
-    entrypoint: ["pinggy"]
-    init: true
-    restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    command:
-      - "-p"
-      - "443"
-      - "-R0:${WIREGUARD_HOST:-host.docker.internal}:${WIREGUARD_PORT:-51820}"
-      - "-L0.0.0.0:4300:localhost:4300"
-      - "${PINGGY_TOKEN:?Set PINGGY_TOKEN in .env}+udp@${PINGGY_SERVER:-free.pinggy.io}"
-
   keeper:
     build: .
     init: true
     restart: unless-stopped
-    depends_on:
-      - pinggy
+    network_mode: host
     read_only: true
     environment:
-      PINGGY_URLS_URL: http://pinggy:4300/urls
+      PINGGY_TOKEN: ${PINGGY_TOKEN:?Set PINGGY_TOKEN in .env}
+      PINGGY_SERVER: ${PINGGY_SERVER:-free.pinggy.io}
       FREEDNS_TOKEN: ${FREEDNS_TOKEN:?Set FREEDNS_TOKEN in .env}
+      WIREGUARD_PORT: ${WIREGUARD_PORT:-51820}
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-10}

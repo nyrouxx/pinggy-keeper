@@ -1,3 +1,4 @@
 *
 !Dockerfile
-!keeper.mjs
+!requirements.txt
+!keeper.py

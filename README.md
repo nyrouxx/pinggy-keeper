@@ -1,13 +1,20 @@
 # pinggy-keeper
 
-Обновляет AAAA-запись FreeDNS для клиента WG Tunnel. Официальный клиент Pinggy
-открывает UDP-туннель до существующего сервера WireGuard. Keeper опрашивает
-`GET /urls` в Pinggy Web Debugger, разрешает публичное имя туннеля в IPv4 и
-публикует адрес вместе с портом в формате IP4P. [Pinggy API](https://pinggy.io/docs/api/web_debugger_api/) · [IP4P в WG Tunnel](https://www.wgtunnel.com/docs/guides/ip4p-self-hosting/)
+Python-сервис открывает UDP-туннель через официальный Pinggy SDK, читает
+публичный адрес из `tunnel.urls` и публикует IPv4 и порт в AAAA-записи FreeDNS
+в формате IP4P. [Pinggy Python SDK](https://github.com/Pinggy-io/sdk-python/blob/main/API_DOC.md) · [IP4P в WG Tunnel](https://www.wgtunnel.com/docs/guides/ip4p-self-hosting/)
 
 Например, `203.0.113.8:51820` кодируется в `2001::ca6c:cb00:7108`.
-При изменении только порта запись тоже обновится. При временном сбое keeper
-повторит запрос и опубликует адрес, когда оба сервиса ответят.
+При изменении только порта запись тоже обновится. После обрыва keeper открывает
+туннель заново, а при временной ошибке FreeDNS повторяет обновление.
+
+## Локальный порт
+
+Запускайте Compose на том Linux-хосте, где доступен UDP-порт WireGuard.
+`network_mode: host` даёт контейнеру доступ к `127.0.0.1` этого хоста. В `.env`
+задайте только `WIREGUARD_PORT` для локального проброса, например
+`WIREGUARD_PORT=51820`. Pinggy сам выдаёт публичный порт, который попадает в IP4P.
+[Режим сети host в Docker](https://docs.docker.com/engine/network/drivers/host/)
 
 ## Настройка
 
@@ -25,16 +32,18 @@
    chmod 600 .env
    ```
 
-4. При необходимости задайте `WIREGUARD_HOST` и `WIREGUARD_PORT`. По умолчанию
-   используется UDP-порт `51820` на хосте Docker. Для сервера на другом устройстве
-   укажите его LAN-адрес, доступный из контейнера. `PINGGY_SERVER` по умолчанию
-   равен `free.pinggy.io`, а `POLL_INTERVAL_SECONDS` равен `10`.
-5. Запустите оба контейнера из каталога проекта.
+4. Укажите ваш локальный `WIREGUARD_PORT`. По умолчанию используется `51820`.
+   `PINGGY_SERVER` и `POLL_INTERVAL_SECONDS` задаются по необходимости, их значения
+   по умолчанию `free.pinggy.io` и `10`.
+5. Запустите контейнер из каталога проекта.
 
    ```sh
    docker compose up -d --build
    docker compose logs -f keeper
    ```
+
+При переходе с предыдущей версии запустите `docker compose up -d --build --remove-orphans`
+в том же Compose-проекте. Команда удалит прежний отдельный контейнер Pinggy.
 
 После первого успешного ответа FreeDNS в журнале появится `FreeDNS AAAA` с
 опубликованным значением. Его можно проверить командой `dig +short AAAA wg.example.com`,
@@ -53,6 +62,9 @@ WG Tunnel подставляет порт из IP4P. Включите **Dynamic 
 
 ## Проверки
 
-Для локальной проверки кодирования и смены endpoint запустите `node --test`
-с Node.js 24. Тест подставляет ответ FreeDNS и использует локальный HTTP-сервер
-вместо Pinggy.
+Локальные тесты проверяют адрес назначения, кодирование IP4P, смену IPv4 и порта
+и повтор после ошибки FreeDNS. Запуск с Python 3.13 и тестовыми ответами сервисов.
+
+```sh
+python -m unittest
+```
